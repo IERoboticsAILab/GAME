@@ -36,8 +36,10 @@ def main():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sent = {name: 0 for name in BODIES}
     lost = {name: 0 for name in BODIES}
+    frames = [0]  # rigid body samples received for any body
 
     def on_rigid_body(rb):
+        frames[0] += 1
         port = BODIES.get(rb.name)
         if port is None:
             return
@@ -56,6 +58,13 @@ def main():
     try:
         while True:
             time.sleep(STATUS_EVERY)
+            if client.id_to_name and not frames[0]:
+                # Motive answered (we have the body names) but no frames arrive: Windows
+                # Firewall lets replies from port 1510 in, but drops the frames from 1511.
+                print(time.strftime("%H:%M:%S"), f"Motive answers but no frames arrive. Windows Firewall is"
+                      f" probably blocking UDP from {MOTIVE_IP} port 1511 (see README).", flush=True)
+                continue
+            frames[0] = 0
             parts = []
             for name in BODIES:
                 if sent[name]:

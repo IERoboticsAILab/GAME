@@ -52,6 +52,12 @@ this PC. It needs any Python 3, nothing to install. Every 5 s it prints each bod
 `NOT TRACKED` / `NOT IN MOTIVE`. Stop it with Ctrl+C. If the game runs on another PC, pass that PC's IP:
 `python natnet_bridge.py 10.205.3.218`. Motive must stream NatNet (Enable on, Unicast, Rigid Bodies on).
 
+**Windows Firewall:** Motive sends the frames from its port 1511, which Windows blocks by default
+(the bridge then says *Motive answers but no frames arrive*). Allow them once, in PowerShell as Administrator:
+```
+New-NetFirewallRule -DisplayName "OptiTrack NatNet from Motive" -Direction Inbound -Protocol UDP -RemoteAddress 10.205.3.3 -RemotePort 1511 -Action Allow
+```
+
 `BODIES` at the top of `natnet_bridge.py` maps each rigid body to a port: `GAME_Player2` to 9878 and
 `GAME_Player3` to 9879. If the mallets appear on the wrong halves, swap the names. A body Motive can't
 see is not sent, so its mallet stays put.
