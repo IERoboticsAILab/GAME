@@ -9,6 +9,7 @@ their own half.
 - `hockey_game.py`: game logic, UDP input, drawing (numpy + cv2). Run
   `python3 hockey_game.py` to self-check (it writes `preview.png`).
 - `script_top_callbacks.py`: paste into the Script TOP's callbacks DAT.
+- `natnet_bridge.py` + `natnet_client.py`: read the players from Motive and send them to the game (run outside TouchDesigner, see below).
 
 ## TouchDesigner network
 Save your `.toe` in this folder, next to `hockey_game.py`.
@@ -42,6 +43,19 @@ def onKey(dat, key, character, alt, lAlt, rAlt, ctrl, lCtrl, rCtrl, shift, lShif
 ```
 
 ## Tracking input
+Start the bridge, then open the `.toe`. On the TD PC, in this folder:
+```
+python natnet_bridge.py
+```
+It reads the two rigid bodies from Motive (`10.205.3.3`, NatNet unicast) and sends them to the game on
+this PC. It needs any Python 3, nothing to install. Every 5 s it prints each body's rate, or
+`NOT TRACKED` / `NOT IN MOTIVE`. Stop it with Ctrl+C. If the game runs on another PC, pass that PC's IP:
+`python natnet_bridge.py 10.205.3.218`. Motive must stream NatNet (Enable on, Unicast, Rigid Bodies on).
+
+`BODIES` at the top of `natnet_bridge.py` maps each rigid body to a port: `GAME_Player2` to 9878 and
+`GAME_Player3` to 9879. If the mallets appear on the wrong halves, swap the names. A body Motive can't
+see is not sent, so its mallet stays put.
+
 The message format and ports are the same as the GAMA version. Trackers send UDP to the TD host:
 
 | Player | Half | Port | Scores into |
