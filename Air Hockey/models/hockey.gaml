@@ -1,4 +1,3 @@
-
 /**
 * Name: hockey
 * Air Hockey Game
@@ -10,35 +9,29 @@
 model hockey
 
 global {
-	
-	
 	// REAL-WORLD DIMENSIONS FOR LAB SET-UP
 	geometry shape <- rectangle(137.5, 68.5); //, by  each square in the floor is 50 cm and so we have a predefined area of 7 by 4 squares
-	point correction <- {83.3, -202.7, 0}; ///['71.20521068572998','-106.8634033203125'];
-   	list<geometry> arena_keystone <-  [{0.021043796631091512,0.03627165536867183,0.0},{0.09118978540139688,0.9339337705784905,0.0},{0.8526934235823587,0.9442971006838257,0.0},{0.9179291931387428,0.010363330105334967,0.0}];
-   	
-   	float grid_width <- shape.width;
+	point correction <- {-38.33982050418854, 72.43500351905823, 0}; ///['71.20521068572998','-106.8634033203125'];
+	list<geometry> arena_keystone <- [{0.0736697534742366,0.23169516447101535,0.0},{0.0675060826301559,1.0367573972528539,0.0},{0.8445979162363061,1.011437353862544,0.0},{0.8474850121913879,0.23125704030401106,0.0}];
+	float grid_width <- shape.width;
 	float grid_height <- shape.height;
 	
 	// AGENT PORT VARIABLES 
 	int port <- 9876;
     string url <- "localhost";
     int number_of_agents <- 2;
-    int base_id <- 4;
+    int base_id <- 2;
 	
 	// DISPLAY OPTIONS
 	bool show_puck <- true;
-	bool show_player <- true;
-	
 	bool show_border <- false;
-//	string show_board <- "../images/game.jpg";
 	bool show_board <- true;
 	
 	// OFFSET VARIABLES -0.5, -1.5, -2.0, -4.5
-	float x_offset_min <- 3.3;
-	float x_offset_max <- 4.3;
-	float y_offset_min <- 1.4;
-	float y_offset_max <- 1.8;
+	float x_offset_min <- -0.5;
+	float x_offset_max <- -1.5;
+	float y_offset_min <- -2.0;
+	float y_offset_max <- -4.5;
 	
 	// GAME VARIABLES
 	bool game_start <- false;
@@ -49,7 +42,7 @@ global {
 	int win_score <- 10;
 	
 	float full_rotation_threshold <- 90.0;
-	float base_speed <- 1.0;
+	float base_speed <- 2.0;
 	float collision_radius <- 3.0;
     
     point reset_trigger_spot1 <- {grid_width / 4, grid_height / 2, 0.01}; // Spot on the left side
@@ -60,8 +53,6 @@ global {
 	init {
 		create player number: number_of_agents {
 		   do connect to: url protocol: "udp_server" port: port + base_id;
-		   write "connecting player  to port " + (port+base_id);
-		   
 		   base_id <- base_id + 1;
 		   self.name <- string(base_id);
 		   self.id <- base_id;
@@ -75,7 +66,7 @@ species game_object parallel: true skills: [moving, network] {
 	float rot;
 	point target_location;
 	int size <- 3;
-	rgb color;		
+	rgb color;
 	int id;
 	
 	bool is_within_grid(point pos) {
@@ -104,7 +95,7 @@ species game_object parallel: true skills: [moving, network] {
     
     action calculate_offset {
     	float offset_x;
-    		//write self.location;
+    	
     	if (self.location.x >= 0) {
         	offset_x <- x_offset_min + (self.location.x / grid_width) * (x_offset_max - x_offset_min);
     	} else {
@@ -128,10 +119,7 @@ species game_object parallel: true skills: [moving, network] {
 	aspect player {
 		point offset <- calculate_offset();
 		
-		
-		if (show_player) {
-			draw circle(size) at: (self.location + offset) color: color rotate: rot anchor: #center;
-		}
+        draw circle(size) at: (self.location + offset) color: color rotate: rot anchor: #center;
 	}
 }
 
@@ -139,30 +127,24 @@ species player parent: game_object {
 	float rotation_accumulator <- 0.0;
 	
 	reflex fetch when: has_more_message() {
-		write "there is more msg	";	
     	loop while: has_more_message() {
 	        message msg <- fetch_message();
-	        write "RAW MSG " + string(msg.contents);
 	        list<string> coords <- msg.contents regex_matches("[-+]?\\d*\\.?\\d+");
 	        
-	        
-	        //target_location <- {float(coords[1]) + correction.y, float(coords[0]) - correction.x, 0};
-            //target_location <- {float(coords[0]) - correction.x, -(float(coords[1]) + correction.y), 0};
+	        target_location <- {float(coords[1]) + correction.y, float(coords[0]) - correction.x, 0};
             
-            target_location <- {float(coords[0]) - correction.x, -(float(coords[1]) + correction.y), 0};
-            
-          	write "target";  
             float current_rotation <- float(coords[3]) * -100;
             rotation_accumulator <- rotation_accumulator + abs(current_rotation - rot);
             rot <- current_rotation;       
 			
 			if (is_within_grid(target_location) and is_within_side(target_location)) {
-                self.location <- target_location;       
+                self.location <- target_location;
+               
             }	
         }
-     }
+    }
     
-    reflex when: !game_start {
+    reflex reset when: !game_start {
     	if (!game_start and (self.location distance_to reset_trigger_spot1 <= 3.0 or self.location distance_to reset_trigger_spot2 <= 3.0)) {
            if (rotation_accumulator >= full_rotation_threshold) {
                  do reset_game;
@@ -242,10 +224,6 @@ species puck parent: game_object {
             	game_start <- false;
             	do stop_puck;
             } 
-            
-//            else if (game_start) {
-//            	do reset_puck;
-//            }
 
         } else if (self.location distance_to goal2 <= 2) {
             p1_score <- p1_score + 1;
@@ -254,10 +232,6 @@ species puck parent: game_object {
             	game_start <- false;
             	do stop_puck;
             } 
-            
-//            else if (game_start) {
-//            	do reset_puck;
-//            }
         }
     }
     
@@ -269,21 +243,7 @@ species puck parent: game_object {
         direction_x <- direction_x / magnitude;
         direction_y <- direction_y / magnitude;
         speed <- base_speed;
-        
-//        is_resetting <- true;
     }
-    
-//    reflex delayed_reset when: is_resetting and every(50#m) {
-//    	self.location <- {grid_width / 2, grid_height / 2, 0};
-//        direction_x <- rnd(-1.0, 1.0);
-//        direction_y <- rnd(-1.0, 1.0);
-//        float magnitude <- sqrt(direction_x * direction_x + direction_y * direction_y);
-//        direction_x <- direction_x / magnitude;
-//        direction_y <- direction_y / magnitude;
-//        speed <- base_speed;
-//        
-//        is_resetting <- false;
-//    }
     
     action stop_puck {
     	self.location <- {grid_width / 2, grid_height / 2, 0};
@@ -299,7 +259,7 @@ species puck parent: game_object {
 	}
 }
 
-grid space cell_width:15.5 cell_height:15.5 parallel: true {	
+grid space cell_width: 15.5 cell_height: 15.5 parallel: true {	
     aspect dev {
     	if (show_border){
     		draw shape color: #white border: #green width: 1;
@@ -312,10 +272,6 @@ grid space cell_width:15.5 cell_height:15.5 parallel: true {
 }
 
 experiment hockey type: gui virtual: true{
-	// EXPERIMENT VARIABLES
-//	float minimum_cycle_duration<-0.00001;
-
-	
 	// EXPERIMENT PARAMETERS 
     parameter "URL" var: url <- url among: ["10.205.3.55", "127.0.0.1","10.205.3.9", "10.205.3.82", "localhost"] category: "Connection Variables";
     parameter "PORT" var: port <- port among: [9876, 1234, 53408] category: "Connection Variables";
@@ -325,8 +281,6 @@ experiment hockey type: gui virtual: true{
     // DISPLAY PARAMETERS
     parameter "Show Grid" var: show_border <- show_border category: "Display Options";
     parameter "Puck" var: show_puck <- show_puck category: "Display Options";
-    parameter "Player" var: show_player <- show_player category: "Display Options";
-//    parameter "Board" var: show_board <- "../images/game.jpg" among: ["../images/", "../images/example.jpg", "../images/game.jpg"] category: "Display Options";
 	parameter "Show Board" var: show_board <- show_board category: "Display Options";
     
     // OFFSET PARAMETERS
@@ -357,7 +311,6 @@ experiment Main parent: hockey type: gui {
 		display main_display parent: default fullscreen: 1  {
 			species space position: {0, 0, -0.01} aspect: dev;
 			
-//			image_layer show_board color:#black refresh: false;
 			graphics game {
 				if (show_board) {
 			    	draw shape color: #white border: #grey width: 8;		   	 
