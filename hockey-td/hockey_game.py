@@ -297,6 +297,8 @@ class Game:
         self.started = True
         self.first = False
         self.flash = None
+        if self.mode != "attract":  # someone started this (spin, Textport, key): they're here
+            self.seen = self.clock
         self.effects = {"left": {}, "right": {}}
         self.item, self.next_item = None, self.clock + POWER_EVERY
         self.replay = []
@@ -996,6 +998,16 @@ if __name__ == "__main__":
     msg(al, 20, 20)
     a.update(t + 0.016)
     assert not a.started and a.first and a.mode == "classic" and not a.ai
+    # starting a game by hand (Textport) while attract is running sticks, even with no tracker moving
+    for _ in range(int((ABANDON_AFTER + 5) / 0.1)):
+        t += 0.1
+        a.update(t)
+    assert a.mode == "attract"  # nobody has moved for over ABANDON_AFTER
+    a.start("classic")
+    for _ in range(30):
+        t += 1 / 60
+        a.update(t)
+    assert a.mode == "classic" and a.started, a.mode
     # an attract game that reaches WIN_SCORE starts over instead of sitting on the result
     a.start("attract")
     a.scores["left"] = WIN_SCORE - 1
@@ -1007,8 +1019,8 @@ if __name__ == "__main__":
     a.step(a.pause_until - a.clock + 0.01)
     a.step(1 / 60)
     assert a.mode == "classic" and not a.started  # back to the start screen ...
-    a.step(ATTRACT_AFTER)
-    assert a.mode == "attract" and a.started and a.scores == {"left": 0, "right": 0}  # ... and attract again
+    assert run(a, ATTRACT_AFTER + 1, lambda: a.mode == "attract")  # ... and attract again
+    assert a.started and a.scores == {"left": 0, "right": 0}
     # a game nobody is playing any more ends after ABANDON_AFTER, and attract takes over
     a.start("classic")
     t0 = t
