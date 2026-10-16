@@ -2,8 +2,10 @@
 
 ## Run it
 1. **Projectors**: in Home Assistant, switch on the projectors **North East** and **South East**.
+   Then switch the projectors on with the remote control.
 2. **Sound**: in Home Assistant, switch on the sound system and click **USB**.
-3. **Motive** (on the Motive PC): open it and check the pucks are tracked.
+3. **OptiTrack**: in Home Assistant, switch on OptiTrack. Then in **Motive** (on the Motive PC), make sure
+   the rigid bodies **GAME_Player2** and **GAME_Player3** are selected and being tracked.
 4. **Bridge** (on the TouchDesigner PC): open a terminal in the `hockey-td` folder and run:
    ```
    python natnet_bridge.py
