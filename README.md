@@ -1,8 +1,8 @@
 # GAME: air hockey
 
 ## Run it
-1. **Projectors**: switch them on.
-2. **Sound**: switch on the sound system and connect it to the TouchDesigner PC with the USB cable.
+1. **Projectors**: in Home Assistant, switch on the projectors **North East** and **South East**.
+2. **Sound**: in Home Assistant, switch on the sound system and click **USB**.
 3. **Motive** (on the Motive PC): open it and check the pucks are tracked.
 4. **Bridge** (on the TouchDesigner PC): open a terminal in the `hockey-td` folder and run:
    ```
