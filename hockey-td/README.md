@@ -93,6 +93,42 @@ You can test without trackers. With the room1 correction, this puts player 1 at 
 python3 -c "import socket;socket.socket(2,2).sendto(b'251.6 286.0 0 0',('127.0.0.1',9879))"
 ```
 
+## Game modes
+The start screen shows three squares in each half, labelled upright for that player:
+**Power-ups**, **Classic** and **vs Computer**. Stand on one and spin the mallet to play it.
+Classic is in the middle, where the single Start square used to be, and plays exactly as before.
+
+- **Classic:** first to `WIN_SCORE`.
+- **Power-ups:** classic, plus a power-up on the table every `POWER_EVERY` seconds. Touch it with
+  your mallet to collect it. Effects last `POWER_TIME` seconds and show as a coloured ring around the
+  mallet and a label in that player's half:
+  - ring symbol, orange: **Big mallet**, your mallet is `BIG` times bigger.
+  - dot, purple: **Small goal**, the opponent's goal mouth shrinks to `SMALL_GOAL` of its width.
+  - plus, pink: **Power hit**, your hits send the puck `POWER_HIT` times faster.
+  - snowflake, blue: **Freeze**, the opponent's mallet stops for `FREEZE_TIME` seconds.
+- **vs Computer:** the computer plays the half opposite whoever started it.
+- **Attract:** when no tracker has moved for `ATTRACT_AFTER` seconds on the start screen, the computer
+  plays both sides with "Grab a mallet to play!". The moment a tracker moves, it goes back to the start
+  screen. A game nobody is playing any more (no tracker moving for `ABANDON_AFTER` seconds) ends the
+  same way, so the table never sits frozen mid-game.
+
+"Moving" means a tracker moved `ACTIVE_MOVE` units. The NatNet bridge streams every Motive frame
+even when nothing moves, so data alone doesn't count.
+
+**Goal replay (every mode):** the game keeps the last `REPLAY_TIME` seconds of play. After a goal it
+shows "GOAL!" for `GOAL_FLASH` seconds, then replays them at `REPLAY_SPEED` (0.5 = half speed) with
+"REPLAY", then serves. The winning goal gets its replay before the result.
+
+**Computer player knobs:** `AI_SPEED` (top speed; people manage about 250), `AI_REACTION` (how far its aim
+lags the puck), `AI_ERROR` (how far off its guarding can be, picked again each time the puck comes
+over; this is the main difficulty knob, 0 makes it very hard to score on) and `AI_INCOMING` (shots
+faster than this get goalkeeping instead of a strike). At the defaults it saves roughly 4 out of 5
+hard straight shots; bank shots off the walls beat it more often.
+
+**Stuck puck:** a puck that sits still for `STALL_TIME` seconds drifts back towards the centre at
+`STALL_PUSH`, like the air on a real table. A puck pressed into a deep corner can't be pushed out by any
+mallet (mallets stay further inside the rails than the puck), so without this a game could stall.
+
 ## Tuning (top of `hockey_game.py`)
 Game: `WIN_SCORE`, `SPIN_TO_START`, `GOAL_PAUSE`, `SERVE_SPEED`, `PLAYERS`.
 Physics: `AIR_DRAG` (how fast the puck slows), `E_WALL`, `E_MALLET` and `E_POST` (bounciness, 0 to 1),
@@ -128,9 +164,11 @@ Loudness knobs are `SOUND_FULL`, `SOUND_MIN` and `SOUND_GAP` in `hockey_game.py`
 
 ## Textport commands
 ```python
-import hockey_game; hockey_game.get_game().reset_game()   # start playing now
-import hockey_game; hockey_game.get_game().stop_game()    # back to the Start squares
+import hockey_game; hockey_game.get_game().start("classic")    # or "powerups", "computer", "attract"
+import hockey_game; hockey_game.get_game().reset_game()        # restart the current mode
+import hockey_game; hockey_game.get_game().stop_game()         # back to the start screen
 ```
+`start("computer", "left")` puts the computer on the right half (the half opposite the side you give).
 `get_game().events` lists each frame's hits, wall and post bounces, and goals, which you could use to trigger sounds.
 
 ## Getting NDI to the remote sites
@@ -152,6 +190,7 @@ Restarting TouchDesigner also works.
   the tracker, so it carries into each hit, and bounces lose energy according to restitution. Glancing
   hits spin the puck through friction. The goal mouths have real posts, and fast shots can't pass through mallets.
   It no longer depends on frame rate.
-- After a goal there's a "GOAL!" pause, then the puck is placed on the side that was scored on.
+- After a goal there's a "GOAL!" pause and a slow-motion replay, then the puck is placed on the side that was scored on.
+- Game modes: power-ups, a computer opponent, and an attract mode when nobody is playing.
 - Mallets that step past the centre line or off the table stop at the edge instead of freezing.
 - Each half has its own score and messages, and debug `write` spam is gone.
