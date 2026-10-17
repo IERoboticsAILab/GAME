@@ -115,6 +115,18 @@ Classic is in the middle, where the single Start square used to be, and plays ex
 "Moving" means a tracker moved `ACTIVE_MOVE` units. The NatNet bridge streams every Motive frame
 even when nothing moves, so data alone doesn't count.
 
+**Exit to menu:** during a game, turn your mallet a full circle (`EXIT_SPIN` degrees within
+`SPIN_WINDOW` seconds) and the game pauses with "Exit to menu? Spin again to exit". Spin again within
+`EXIT_CONFIRM` seconds to go back to the start screen; otherwise play carries on. The spin that picked
+the mode doesn't count, for the first `SPIN_WINDOW` seconds of a game.
+
+**Lost mallet:** if a mallet that was being tracked sends nothing for `LOST_AFTER` seconds (Motive lost
+it, or it's being carried between tables), the game pauses with "Waiting for Player N". When it's
+back: "Get ready!" for `RESUME_DELAY` seconds, then play carries on. It waits as long as it takes; the
+puck, power-up timers and replay all stand still. A mallet that wasn't tracked when the game started
+(a game against the computer, or a mallet left in a drawer) never holds a game up. This relies on the
+NatNet bridge, which sends every frame while a mallet is tracked and nothing when it isn't.
+
 **Goal replay (every mode):** the game keeps the last `REPLAY_TIME` seconds of play. After a goal it
 shows "GOAL!" for `GOAL_FLASH` seconds, then replays them at `REPLAY_SPEED` (0.5 = half speed) with
 "REPLAY", then serves. The winning goal gets its replay before the result.

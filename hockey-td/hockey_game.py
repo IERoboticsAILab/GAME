@@ -47,7 +47,7 @@ PLAYERS = [
 
 # GAME
 WIN_SCORE = 10
-SPIN_TO_START = 90.0  # accumulated rotation needed on a Start square
+SPIN_TO_START = 90.0  # rotation needed on a mode square, in heading radians x 100 (90 ~ 50 degrees)
 START_SPOT = {"left": (W / 4, H / 2), "right": (3 * W / 4, H / 2)}
 GOAL_PAUSE = 1.5  # minimum seconds after a goal before the puck comes back
 SERVE_SPEED = 25.0  # opening face-off push; after a goal the puck is placed, not served
@@ -77,6 +77,13 @@ SMALL_GOAL = 0.5  # opponent's goal mouth with "small_goal"
 POWER_HIT = 1.5  # puck speed off your mallet with "power_hit"
 POWERS = ("big", "small_goal", "power_hit", "freeze")
 POWER_LABEL = {"big": "BIG MALLET", "small_goal": "SMALL GOAL", "power_hit": "POWER HIT", "frozen": "FROZEN!"}
+
+# PAUSES (during a game)
+EXIT_SPIN = 360.0  # degrees of turning, within SPIN_WINDOW, that opens "Exit to menu?"
+SPIN_WINDOW = 3.0  # s
+EXIT_CONFIRM = 5.0  # s to spin again and exit; otherwise the game carries on
+LOST_AFTER = 0.5  # s with no data from a tracked mallet -> paused until it's back
+RESUME_DELAY = 2.0  # s of "Get ready!" once it's back
 
 # GOAL REPLAY (all modes)
 REPLAY_TIME = 2.5  # s of play before a goal that the replay shows
@@ -185,8 +192,12 @@ class Player:
         self.r = MALLET_R  # current radius ("big" power-up changes it)
         self.vel = (0.0, 0.0)
         self.t_sample, self.p_sample = None, self.pos
-        self.rot = 0.0
-        self.spin = 0.0
+        self.heading = None  # last heading from the tracker (radians)
+        self.turn = 0.0  # total turning so far (radians, +- by direction, no wrap-around)
+        self.spin = 0.0  # turning on a mode square (either direction, heading radians x 100)
+        self.fresh = False  # a tracker message moved the mallet since the game last looked
+        self.last_msg = None  # game wall time of the last such message
+        self.present = False  # tracked during this game, so losing it pauses the game
         self.color = PLAYER_C[side]
         self.sock = None
         if bind:
@@ -211,9 +222,12 @@ class Player:
         nums = NUM_RE.findall(text)
         if len(nums) < 4:
             return False
-        rot = float(nums[3]) * -100
-        self.spin += abs(rot - self.rot)
-        self.rot = rot
+        h = float(nums[3])
+        if self.heading is not None:
+            d = (h - self.heading + math.pi) % (2 * math.pi) - math.pi  # +-180 degree wrap is no turn
+            self.turn += d
+            self.spin += abs(d) * 100
+        self.heading = h
         for name, t in self.tables.items():  # first table the point is over
             x, y = to_table(float(nums[0]), float(nums[1]), t)
             if -GLITCH <= x <= W + GLITCH and -GLITCH <= y <= H + GLITCH:
@@ -222,6 +236,7 @@ class Player:
         else:  # between tables, or a glitch
             return False
         self.raw = self.pos = clamp((x, y), self.side, self.r)
+        self.fresh = True
         return True
 
     def moved(self):
@@ -260,7 +275,12 @@ class Game:
         self.started = False
         self.first = True
         self.t = None  # last frame's clock (from TouchDesigner)
-        self.clock = 0.0  # game time, advances with step()
+        self.clock = 0.0  # game time, advances with step() but stands still while paused
+        self.wall = 0.0  # advances with step() always
+        self.pause = None  # None, "exit" (Exit to menu?), "lost" (waiting for a mallet) or "ready"
+        self.pause_side, self.pause_end = None, 0.0
+        self.turns = {}  # side -> deque of (wall, turn) over the last SPIN_WINDOW
+        self.started_wall = 0.0
         self.flash = None  # side that just scored, during the goal pause
         self.pause_until = 0.0
         self.serve_side = None
@@ -299,6 +319,9 @@ class Game:
         self.flash = None
         if self.mode != "attract":  # someone started this (spin, Textport, key): they're here
             self.seen = self.clock
+        self.pause, self.turns, self.started_wall = None, {}, self.wall
+        for p in self.players:  # only mallets being tracked now can pause the game by going missing
+            p.present = p.last_msg is not None and self.wall - p.last_msg <= LOST_AFTER
         self.effects = {"left": {}, "right": {}}
         self.item, self.next_item = None, self.clock + POWER_EVERY
         self.replay = []
@@ -313,6 +336,7 @@ class Game:
         self.mode, self.ai = "classic", set()
         self.effects = {"left": {}, "right": {}}
         self.item, self.replay = None, []
+        self.pause = None
         self.reset_puck()
 
     def reset_puck(self):
@@ -360,6 +384,15 @@ class Game:
         return cues
 
     def step(self, dt):
+        self.wall += dt
+        for p in self.players:
+            if p.fresh:
+                p.fresh, p.last_msg = False, self.wall
+                p.present = p.present or self.started
+        if self._paused():  # everything stands still: puck, timers, replay
+            for p in self.players:
+                p.prev = p.pos  # no sweep through the puck when play resumes
+            return
         self.clock += dt
         self._idle()
         if self.started:
@@ -389,6 +422,48 @@ class Game:
         for p in self.players:
             p.prev = p.pos
         self.rings = [r for r in self.rings if self.clock - r[2] < RING_TIME]
+
+    def _paused(self):
+        """Run the pauses; True while the game is paused.
+        A tracked mallet that goes missing pauses until it's back (then "Get ready!").
+        A full spin of a mallet asks "Exit to menu?"; another spin exits, else play carries on."""
+        if not self.started or self.mode == "attract":
+            self.pause = None
+            return False
+        humans = [p for p in self.players if p.side not in self.ai]
+        lost = [p for p in humans if p.present and self.wall - p.last_msg > LOST_AFTER]
+        spun = next((p for p in humans if self._full_spin(p)), None)
+        if lost:
+            self.pause, self.pause_side = "lost", lost[0].side
+        elif self.pause == "lost":
+            self.pause, self.pause_end = "ready", self.wall + RESUME_DELAY
+        elif self.pause == "exit":
+            if spun:
+                self.stop_game()
+                return False
+            if self.wall >= self.pause_end:
+                self.pause = None
+        elif self.pause == "ready":
+            if self.wall >= self.pause_end:
+                self.pause = None
+        elif spun:
+            self.pause, self.pause_side, self.pause_end = "exit", spun.side, self.wall + EXIT_CONFIRM
+        return self.pause is not None
+
+    def _full_spin(self, p):
+        """True when p has turned EXIT_SPIN within SPIN_WINDOW (then it starts counting afresh).
+        Not right after the game starts, so the spin that picked the mode doesn't count."""
+        if self.wall - self.started_wall < SPIN_WINDOW:
+            self.turns.pop(p.side, None)
+            return False
+        log = self.turns.setdefault(p.side, deque())
+        log.append((self.wall, p.turn))
+        while log[0][0] < self.wall - SPIN_WINDOW:
+            log.popleft()
+        if max(abs(p.turn - t) for _, t in log) >= math.radians(EXIT_SPIN):
+            log.clear()
+            return True
+        return False
 
     def _idle(self):
         """Attract mode when nobody is around; out of it as soon as a tracker moves."""
@@ -671,7 +746,15 @@ class Game:
             layer = np.zeros((img.shape[0], hw, 4), np.uint8)
             cx, cy = W / 4, H / 2
             text(layer, f"{self.scores['left']} : {self.scores['right']}", (cx, cy - 19), 5, rgba(DARK))
-            if self.first:
+            if self.pause:
+                who = "Player 1" if self.pause_side == "left" else "Player 2"
+                big, small = {"exit": ("Exit to menu?", "Spin again to exit"),
+                              "lost": (f"Waiting for {who}", "Bring the mallet back to the table"),
+                              "ready": ("Get ready!", "")}[self.pause]
+                text(layer, big, (cx, cy - 12), 4, rgba(DARK))
+                if small:
+                    text(layer, small, (cx, cy - 6), 2.5, rgba(DARK))
+            elif self.first:
                 text(layer, "Pick a mode: stand on it and spin!", (cx, cy - 12), 3, rgba(GREEN))
             elif self.flash:
                 word = "REPLAY" if self.replaying() else "GOAL!"
@@ -703,7 +786,8 @@ class Game:
     def render(self):
         """Full table, top row = top of table."""
         replaying = self.replaying()
-        key = (self.scores["left"], self.scores["right"], self.started, self.first, self.flash, replaying,
+        key = (self.pause, self.pause_side,
+               self.scores["left"], self.scores["right"], self.started, self.first, self.flash, replaying,
                self.mode, tuple(sorted(self.ai)), self.goal_half("left"), self.goal_half("right"),
                self.active("left"), self.active("right"))
         if key != self._bg_key:
@@ -875,9 +959,10 @@ if __name__ == "__main__":
     # spin on the Start square starts the game
     msg(left, *START_SPOT["left"])
     left.spin = 0
-    msg(left, *START_SPOT["left"], 1.0)  # rot -100 -> spin 100
+    msg(left, *START_SPOT["left"], 1.0)  # 1 radian of turning -> spin 100
     g.step(0.016)
     assert g.started and not g.first
+    left.present = right.present = False  # from here on the checks move the mallets by hand, not by tracker
     still(left, (10, 60)); still(right, (130, 60))
 
     # wall: bounces with restitution, drag barely slows it
@@ -953,7 +1038,7 @@ if __name__ == "__main__":
             assert tuple(img[int(sy * PX), int((sx + 8) * PX)][:3]) != BLACK
     for mode, off in MODE_SQUARES.items():
         g.stop_game()
-        left.rot = left.spin = 0.0
+        left.heading, left.spin = None, 0.0
         spot = square_spot("left", off)
         msg(left, *spot); msg(left, *spot, 1.0)  # stand on it and spin
         g.step(0.016)
@@ -1029,6 +1114,84 @@ if __name__ == "__main__":
         a.update(t)
     assert a.mode == "attract", a.mode
 
+    # heading wrap-around (+180 -> -180 degrees) is a tiny turn, not a spin
+    wp = Player("left", 0, bind=False)
+    msg(wp, 20, 20, 3.1); msg(wp, 20, 20, -3.1)
+    assert wp.spin < 10 and abs(wp.turn) < 0.1, (wp.spin, wp.turn)
+
+    # pauses: both mallets tracked (the bridge streams every frame)
+    q = Game(bind=False)
+    ql, qr = q.players
+    q.seen = math.inf
+    still(ql, (30, 30)); still(qr, (110, 30))
+
+    def feed(p, turn=0.0):  # one tracker message for p where it is, turned a bit more
+        msg(p, *p.pos, (p.heading or 0.0) + turn)
+
+    def play(secs, spin=0.0, left_tracked=True):  # trackers streaming; left turns `spin` radians
+        n = round(secs * 60)
+        for _ in range(n):
+            if left_tracked:
+                feed(ql, spin / n)
+            feed(qr)
+            q.step(1 / 60)
+
+    play(0.1)
+    q.start("classic")
+    full = math.radians(EXIT_SPIN) + 0.2
+    # the spin that started the game doesn't count, even if it carries on past a full turn
+    play(1.0, full)
+    play(SPIN_WINDOW)
+    assert q.pause is None
+    # small turns while playing don't count either
+    play(2.0, full * 0.8)
+    assert q.pause is None
+    # a full spin: "Exit to menu?", and the game stands still
+    play(1.0, full)
+    assert q.pause == "exit" and q.pause_side == "left"
+    c0, puck0 = q.clock, q.puck
+    q.render()
+    play(1.0)
+    assert q.clock == c0 and q.puck == puck0
+    # nothing more within EXIT_CONFIRM: play carries on
+    play(EXIT_CONFIRM)
+    assert q.pause is None and q.started and q.clock > c0
+    # spin, then spin again: back to the start screen
+    play(1.0, full)
+    assert q.pause == "exit"
+    play(1.0, full)
+    assert not q.started and q.first and q.pause is None
+    # a tracked mallet going missing pauses until it's back, then "Get ready!"
+    q.start("classic")
+    play(0.5)
+    c0 = q.clock
+    play(1.0, left_tracked=False)
+    assert q.pause == "lost" and q.pause_side == "left" and q.clock - c0 < LOST_AFTER + 0.05
+    q.render()
+    play(0.1)
+    assert q.pause == "ready"
+    play(RESUME_DELAY + 0.05)
+    assert q.pause is None and q.started
+    # a mallet that wasn't tracked when the game started doesn't hold the game up
+    q.start("classic")
+    for _ in range(120):
+        feed(qr)
+        q.step(1 / 60)
+    q.start("classic")  # left last seen 2 s ago: not part of this game
+    for _ in range(60):
+        feed(qr)
+        q.step(1 / 60)
+    assert q.pause is None
+    # nor does the computer's half (whatever its tracker does), but the human's does
+    play(0.1)
+    q.start("computer", "left")
+    for _ in range(60):
+        feed(ql)
+        q.step(1 / 60)
+    assert q.pause is None
+    play(1.0, left_tracked=False)
+    assert q.pause == "lost" and q.pause_side == "left"
+
     # power-ups
     pg = Game(bind=False)
     pl, pr = pg.players
@@ -1078,7 +1241,9 @@ if __name__ == "__main__":
     msg(pr, 110, 40)
     pg.step(1 / 60)
     assert near(pr.pos, (110, 40))
-    # a new one appears on the table when it's time
+    # a new one appears on the table when it's time (mallets parked in corners, out of its reach)
+    still(pl, (RAIL + MALLET_R, RAIL + MALLET_R)); still(pr, (W - RAIL - MALLET_R, H - RAIL - MALLET_R))
+    pr.present = False
     pg.next_item = pg.clock
     pg.step(1 / 60)
     kind, (ix, iy) = pg.item
