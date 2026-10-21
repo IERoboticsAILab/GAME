@@ -17,6 +17,7 @@
 ## Textport commands (in TouchDesigner: Alt+T)
 ```python
 import hockey_game; hockey_game.get_game().start("classic")    # or "powerups", "computer", "attract"
+import hockey_game; hockey_game.get_game().start("computer", "left", "hard")   # vs Computer on Hard
 import hockey_game; hockey_game.get_game().stop_game()         # back to the start screen
 import hockey_game, importlib; hockey_game.close(); importlib.reload(hockey_game)   # after editing hockey_game.py
 ```

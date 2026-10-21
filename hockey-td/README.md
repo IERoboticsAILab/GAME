@@ -106,7 +106,15 @@ Classic is in the middle, where the single Start square used to be, and plays ex
   - dot, purple: **Small goal**, the opponent's goal mouth shrinks to `SMALL_GOAL` of its width.
   - plus, pink: **Power hit**, your hits send the puck `POWER_HIT` times faster.
   - snowflake, blue: **Freeze**, the opponent's mallet stops for `FREEZE_TIME` seconds.
-- **vs Computer:** the computer plays the half opposite whoever started it.
+- **vs Computer:** spinning on it turns that player's squares into **Easy / Medium / Hard** (Hard is
+  red); spin on one to start. Nobody picks within `CHOOSE_TIMEOUT` s: the mode squares come back. The
+  computer plays the half opposite whoever started it.
+  - **Easy:** slow and sloppy.
+  - **Medium:** the original computer.
+  - **Hard:** predicts where the puck will cross in front of its goal (wall bounces included), moves
+    about 3x faster, and picks between a straight shot and bank shots off either side wall, whichever
+    path is furthest from your mallet. In simulated games it saved every test shot (straight and
+    banked, up to full speed) and beat Medium about 7-1 in 6 minutes. Expect it to be very hard to score on.
 - **Attract:** when no tracker has moved for `ATTRACT_AFTER` seconds on the start screen, the computer
   plays both sides with "Grab a mallet to play!". The moment a tracker moves, it goes back to the start
   screen. A game nobody is playing any more (no tracker moving for `ABANDON_AFTER` seconds) ends the
@@ -131,11 +139,18 @@ NatNet bridge, which sends every frame while a mallet is tracked and nothing whe
 shows "GOAL!" for `GOAL_FLASH` seconds, then replays them at `REPLAY_SPEED` (0.5 = half speed) with
 "REPLAY", then serves. The winning goal gets its replay before the result.
 
-**Computer player knobs:** `AI_SPEED` (top speed; people manage about 250), `AI_REACTION` (how far its aim
-lags the puck), `AI_ERROR` (how far off its guarding can be, picked again each time the puck comes
-over; this is the main difficulty knob, 0 makes it very hard to score on) and `AI_INCOMING` (shots
-faster than this get goalkeeping instead of a strike). At the defaults it saves roughly 4 out of 5
-hard straight shots; bank shots off the walls beat it more often.
+**Computer player knobs:** `AI_LEVELS` has one line per difficulty: `speed` (top speed; people manage
+about 250), `reaction` (how far its aim lags), `error` (how far off its guarding can be, picked again each
+time the puck comes over; the main knob for Easy and Medium), `incoming` (shots faster than this get
+goalkeeping instead of a strike), `predict`, `banks` and `precision` (how exactly it lines up before
+striking; smaller is more accurate but shoots less). To make Hard beatable, raise its `error` or lower
+its `speed`. `CAREFUL_SPEED` caps its speed near its own goal so it doesn't knock the puck in.
+
+**Shot speed and rallies:** after a goal, the speed of the shot (off the last hit, in km/h at floor
+scale: 1 table unit is about 2.5 cm, so the fastest puck is about 14 km/h) shows under "GOAL!". From
+`RALLY_SHOW` hits in a row, "Rally N" shows in both halves. The start screen shows this session's fastest
+shot and longest rally (people only: the computer's shots and attract mode don't count); beating one
+shows "NEW RECORD!". They reset when TouchDesigner restarts or the module is reloaded.
 
 **Stuck puck:** a puck that sits still for `STALL_TIME` seconds drifts back towards the centre at
 `STALL_PUSH`, like the air on a real table. A puck pressed into a deep corner can't be pushed out by any
@@ -180,7 +195,8 @@ import hockey_game; hockey_game.get_game().start("classic")    # or "powerups", 
 import hockey_game; hockey_game.get_game().reset_game()        # restart the current mode
 import hockey_game; hockey_game.get_game().stop_game()         # back to the start screen
 ```
-`start("computer", "left")` puts the computer on the right half (the half opposite the side you give).
+`start("computer", "left", "hard")` puts the computer on the right half (the half opposite the side you
+give), at "easy", "medium" (the default) or "hard".
 `get_game().events` lists each frame's hits, wall and post bounces, and goals, which you could use to trigger sounds.
 
 ## Getting NDI to the remote sites

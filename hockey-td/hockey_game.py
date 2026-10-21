@@ -61,11 +61,30 @@ ATTRACT_AFTER = 30.0  # s with no tracker moving on the start screen -> the comp
 ABANDON_AFTER = 60.0  # s with no tracker moving mid-game -> back to the start screen
 ACTIVE_MOVE = 1.0  # a tracker counts as moving once it is this far from where it last was
 
-# COMPUTER PLAYER
-AI_SPEED = 70.0  # top mallet speed (people manage ~250)
-AI_REACTION = 0.15  # s, how far its aim lags behind the puck
-AI_ERROR = 7.0  # how far off its guarding can be; picked again each time the puck comes over
-AI_INCOMING = 20.0  # a puck coming at its goal faster than this gets goalkeeping, not a strike
+# COMPUTER PLAYER, per difficulty (picked after spinning on "vs Computer"):
+#   speed     top mallet speed (people manage ~250)
+#   reaction  s, how far its aim lags behind where it wants to be
+#   error     how far off its guarding can be; picked again each time the puck comes over
+#   incoming  a puck coming at its goal faster than this gets goalkeeping, not a strike
+#   predict   guard where the puck WILL cross (bounces included), not where it is now
+#   banks     also consider bank shots off the side walls, away from the opponent's mallet
+#   precision how close to the spot behind the puck it must be before it strikes (smaller = more
+#             accurate shots, but fewer of them; 1.4 scored most in simulated games)
+AI_LEVELS = {
+    "easy": dict(speed=45.0, reaction=0.25, error=10.0, incoming=20.0, predict=False, banks=False, precision=3.0),
+    "medium": dict(speed=70.0, reaction=0.15, error=7.0, incoming=20.0, predict=False, banks=False, precision=3.0),
+    "hard": dict(speed=220.0, reaction=0.02, error=0.5, incoming=20.0, predict=True, banks=True, precision=1.4),
+}
+CAREFUL_SPEED = 70.0  # top speed going round the puck or near its own end rail, so it doesn't clip it in
+LEVEL_SQUARES = {"easy": -20.0, "medium": 0.0, "hard": 20.0}  # replace the mode squares while choosing
+CHOOSE_TIMEOUT = 15.0  # s to pick a difficulty before the mode squares come back
+CHOOSE_GRACE = 1.5  # s after "vs Computer" during which spinning doesn't pick (you're still spinning)
+
+# SHOTS AND RALLIES
+KMH = 0.025 * 3.6  # table units/s -> km/h (1 unit is about 2.5 cm)
+RALLY_SHOW = 5  # show the rally counter from this many hits
+HIT_GAP = 0.25  # s: the same mallet touching the puck again within this is still the same hit
+HIT_MIN = 5.0  # impulse below this is a nudge, not a hit
 
 # POWER-UPS (power-ups mode)
 POWER_EVERY = 8.0  # s from one power-up being collected to the next appearing
@@ -163,6 +182,34 @@ def limits(side, r):
 def clamp(pos, side, r):
     (x0, x1), (y0, y1) = limits(side, r)
     return min(max(pos[0], x0), x1), min(max(pos[1], y0), y1)
+
+
+def bounce(v, w, n, vo, e):
+    """Puck velocity v and spin w after touching a body moving at vo, n pointing from that body to
+    the puck: restitution e plus Coulomb rim friction (what makes glancing hits spin the puck).
+    Returns (v, w, normal impulse); the impulse is 0 if they're already separating."""
+    nx, ny = n
+    # velocity of the puck's rim at the contact point (r = -n R), relative to the other body
+    rx, ry = -nx * PUCK_R, -ny * PUCK_R
+    vrx = v[0] - w * ry - vo[0]
+    vry = v[1] + w * rx - vo[1]
+    vn = vrx * nx + vry * ny
+    if vn >= 0:
+        return v, w, 0.0
+    jn = -(1 + e) * vn  # normal impulse per unit puck mass
+    tx, ty = -ny, nx
+    vt = vrx * tx + vry * ty
+    # tangential impulse: 3 = 1/m + R^2/I for a solid disc; capped by Coulomb friction
+    jt = max(-FRICTION * jn, min(FRICTION * jn, -vt / 3))
+    return (v[0] + jn * nx + jt * tx, v[1] + jn * ny + jt * ty), w - 2 * jt / PUCK_R, jn  # I = R^2 / 2
+
+
+def seg_dist(p, a, b):
+    """Distance from point p to the segment a-b."""
+    ax, ay = b[0] - a[0], b[1] - a[1]
+    L = ax * ax + ay * ay
+    t = 0.0 if L == 0 else min(1.0, max(0.0, ((p[0] - a[0]) * ax + (p[1] - a[1]) * ay) / L))
+    return math.dist(p, (a[0] + ax * t, a[1] + ay * t))
 
 
 def other(side):
@@ -293,6 +340,13 @@ class Game:
         self.ai = set()  # sides the computer plays
         self.ai_aim = {}  # side -> where the computer is heading (lags the puck by AI_REACTION)
         self.ai_err = {}  # side -> (puck in its half?, guarding error for that visit)
+        self.ai_shot = {}  # side -> shot the computer is lining up (index into its candidates)
+        self.level = "medium"  # computer difficulty
+        self.choosing = None  # (side, wall time it started) while that player picks a difficulty
+        self.rally, self.last_hit = 0, (None, -1.0)  # hits since the serve; (side, clock) of the last
+        self.shot = None  # (side, km/h) of the last hit
+        self.goal_kmh, self.new_record = None, False  # shown with "GOAL!"
+        self.best_shot, self.best_rally = 0.0, 0  # this session, people only (not the computer)
         self.seen = 0.0  # clock when a tracker last moved
         self.mode_since = 0.0  # clock when the current mode started
         self.effects = {"left": {}, "right": {}}  # side -> {power-up kind: clock it wears off}
@@ -303,9 +357,11 @@ class Game:
         self.reset_puck()
         self._bg_key = None
 
-    def start(self, mode="classic", side="left"):
-        """Start a game in `mode`. For "computer", the computer plays the half opposite `side`."""
-        self.mode = mode
+    def start(self, mode="classic", side="left", level="medium"):
+        """Start a game in `mode`. For "computer", the computer plays the half opposite `side`
+        at `level` ("easy", "medium" or "hard")."""
+        self.mode, self.level, self.choosing = mode, level, None
+        self.ai_shot = {}
         self.ai = {"computer": {other(side)}, "attract": {"left", "right"}}.get(mode, set())
         self.ai_aim, self.ai_err = {}, {}
         self.mode_since = self.clock
@@ -336,7 +392,7 @@ class Game:
         self.mode, self.ai = "classic", set()
         self.effects = {"left": {}, "right": {}}
         self.item, self.replay = None, []
-        self.pause = None
+        self.pause, self.choosing = None, None
         self.reset_puck()
 
     def reset_puck(self):
@@ -347,6 +403,7 @@ class Game:
         self.trail.clear()
         self.history.clear()
         self.still_since = self.clock
+        self.rally, self.last_hit, self.shot = 0, (None, -1.0), None
 
     def serve(self, side=None):
         """side=None: face-off at centre with a gentle random push towards one player.
@@ -476,15 +533,25 @@ class Game:
             self.stop_game()
 
     def _start_screen(self):
-        """Stand on a mode square and spin to play that mode."""
+        """Stand on a mode square and spin to play that mode. "vs Computer" first turns that
+        player's squares into Easy / Medium / Hard."""
+        if self.choosing and self.wall - self.choosing[1] > CHOOSE_TIMEOUT:
+            self.choosing = None
         for p in self.players:
-            on = next((m for m, off in MODE_SQUARES.items()
+            choosing = self.choosing and self.choosing[0] == p.side
+            squares = LEVEL_SQUARES if choosing else MODE_SQUARES
+            on = next((m for m, off in squares.items()
                        if math.dist(p.pos, square_spot(p.side, off)) <= MODE_RADIUS), None)
-            if on is None:
+            if on is None or (choosing and self.wall - self.choosing[1] < CHOOSE_GRACE):
                 p.spin = 0.0
             elif p.spin >= SPIN_TO_START:
                 p.spin = 0.0
-                self.start(on, p.side)
+                if choosing:
+                    self.start("computer", p.side, on)
+                elif on == "computer":
+                    self.choosing = (p.side, self.wall)
+                else:
+                    self.start(on, p.side)
                 break
 
     def _unstall(self):
@@ -502,16 +569,15 @@ class Game:
 
     def _ai_move(self, p, dt):
         """Guard the goal while the puck is away; get behind it and strike when it's in our half."""
+        lv = AI_LEVELS[self.level]
+        speed = lv["speed"]
         me, toward = p.prev, (1.0 if p.side == "left" else -1.0)
         bx, by = self.puck
         ours = self.live and (bx - W / 2) * toward < 0  # puck in our half
         if ours != self.ai_err.get(p.side, (None,))[0]:  # it came over (or left): new error
-            self.ai_err[p.side] = (ours, random.uniform(-AI_ERROR, AI_ERROR))
-        if ours and self.v[0] * toward > -AI_INCOMING:  # in our half and not a shot at us: play it
-            gx = W if p.side == "left" else 0.0
-            ax, ay = gx - bx, H / 2 - by
-            n = math.hypot(ax, ay) or 1.0
-            ax, ay = ax / n, ay / n  # from the puck towards their goal
+            self.ai_err[p.side] = (ours, random.uniform(-lv["error"], lv["error"]))
+        if ours and self.v[0] * toward > -lv["incoming"]:  # in our half and not a shot at us: play it
+            ax, ay = self._shot_aim(p, lv["banks"])  # from the puck towards where we'll send it
             back = PUCK_R + p.r + 1.0
             raw = (bx - ax * back, by - ay * back)
             behind = clamp(raw, p.side, p.r)  # by the rails, as close behind as we can get
@@ -523,6 +589,7 @@ class Game:
                 # too close to our end rail to get behind: any hit from the wrong angle only goes into
                 # the boards or our own goal. Hit it if the angle is good, else keep clear on the
                 # centre side and wait for it to drift out (see _unstall)
+                speed = min(speed, CAREFUL_SPEED)  # close to our own goal: no wild moves
                 if their_way and n < back + 3:
                     target = (bx + ux * 4, by + uy * 4)
                 else:  # wait beside the line it will drift along, so it drifts past us
@@ -535,23 +602,74 @@ class Game:
                 # on the wrong side: go round it on the side we're on, not through it
                 side = 1.0 if (me[0] - bx) * -ay + (me[1] - by) * ax > 0 else -1.0
                 target = (behind[0] - ay * side * back * 1.5, behind[1] + ax * side * back * 1.5)
-            elif math.dist(me, behind) < 3.0 and their_way:
+                speed = min(speed, CAREFUL_SPEED)  # don't clip it on the way round
+            elif math.dist(me, behind) < lv["precision"] and their_way:
                 target = (bx + ux * 4, by + uy * 4)  # in position: strike through it
             else:
                 target = behind
         else:
             gx = 0.0 if p.side == "left" else W
             gh = self.goal_half(p.side)
-            gy = by + self.ai_err[p.side][1]
-            target = (gx + toward * (RAIL + p.r + 6), H / 2 + min(max(gy - H / 2, -gh), gh))
+            line = gx + toward * (RAIL + p.r + 6)  # where we guard, in front of the goal
+            gy = by
+            if lv["predict"] and self.live and self.v[0] * toward < -1.0:  # coming our way
+                gy = self._crossing(line)
+            gy += self.ai_err[p.side][1]
+            target = (line, H / 2 + min(max(gy - H / 2, -gh), gh))
         aim = self.ai_aim.get(p.side, target)
-        k = min(1.0, dt / AI_REACTION) if AI_REACTION > 0 else 1.0
+        k = min(1.0, dt / lv["reaction"]) if lv["reaction"] > 0 else 1.0
         aim = (aim[0] + (target[0] - aim[0]) * k, aim[1] + (target[1] - aim[1]) * k)
         self.ai_aim[p.side] = aim
         d = math.dist(me, aim)
-        f = min(1.0, AI_SPEED * dt / d) if d > 1e-9 else 0.0
+        f = min(1.0, speed * dt / d) if d > 1e-9 else 0.0
         p.pos = clamp((me[0] + (aim[0] - me[0]) * f, me[1] + (aim[1] - me[1]) * f), p.side, p.r)
         p.vel = ((p.pos[0] - me[0]) / dt, (p.pos[1] - me[1]) / dt) if dt > 0 else (0.0, 0.0)
+
+    def _crossing(self, x_line, horizon=2.0, h=1 / 120):
+        """y where the puck will cross x = x_line, following its drag and the side-wall bounces
+        (mallets and posts ignored). The current y if it won't get there within `horizon` s."""
+        (x, y), v, w = self.puck, self.v, self.w
+        lo, hi = RAIL + PUCK_R, H - RAIL - PUCK_R
+        k, kw = math.exp(-AIR_DRAG * h), math.exp(-SPIN_DRAG * h)
+        for _ in range(int(horizon / h)):  # the same steps as _substep, walls only
+            v, w = (v[0] * k, v[1] * k), w * kw
+            nx, ny = x + v[0] * h, y + v[1] * h
+            if (x - x_line) * (nx - x_line) <= 0:
+                return y + (ny - y) * ((x_line - x) / (nx - x) if nx != x else 0.0)
+            x, y = nx, ny
+            if y < lo:
+                y = lo
+                v, w, _ = bounce(v, w, (0.0, 1.0), (0.0, 0.0), E_WALL)
+            elif y > hi:
+                y = hi
+                v, w, _ = bounce(v, w, (0.0, -1.0), (0.0, 0.0), E_WALL)
+        return self.puck[1]
+
+    def _shot_aim(self, p, banks):
+        """Unit vector from the puck along the shot we're lining up: straight at their goal, or
+        (with banks) off the top or bottom wall, whichever path keeps furthest from their mallet."""
+        bx, by = self.puck
+        gx = W if p.side == "left" else 0.0
+        goal = (gx, H / 2)
+        paths = [[(bx, by), goal]]
+        if banks:
+            for wall in (RAIL + PUCK_R, H - RAIL - PUCK_R):
+                # the goal mirrored in that wall, aim there to bank into it; the bounce keeps only
+                # E_WALL of the sideways speed, so the image sits that much further out
+                my = wall - (H / 2 - wall) / E_WALL
+                if (wall - by) * (my - by) > 0:  # the wall is between us and the mirror image
+                    t = (wall - by) / (my - by)
+                    paths.append([(bx, by), (bx + (gx - bx) * t, wall), goal])
+        opp = next(q.pos for q in self.players if q.side != p.side)
+        clear = [min(seg_dist(opp, a, b) for a, b in zip(path, path[1:])) for path in paths]
+        best = max(range(len(paths)), key=clear.__getitem__)
+        keep = self.ai_shot.get(p.side)
+        if keep is not None and keep < len(paths) and clear[keep] > clear[best] - 3.0:
+            best = keep  # don't flip between shots over small differences
+        self.ai_shot[p.side] = best
+        tx, ty = paths[best][1]
+        n = math.hypot(tx - bx, ty - by) or 1.0
+        return (tx - bx) / n, (ty - by) / n
 
     # ---------- power-ups ----------
 
@@ -626,7 +744,7 @@ class Game:
         for i in range(1, n + 1):
             f = i / n  # mallets glide from last frame's position to this one's
             mallets = [((p.prev[0] + (p.pos[0] - p.prev[0]) * f, p.prev[1] + (p.pos[1] - p.prev[1]) * f),
-                        p.vel, p.r, self.has(p.side, "power_hit")) for p in self.players]
+                        p.vel, p.r, self.has(p.side, "power_hit"), p.side) for p in self.players]
             self._substep(h, mallets)
             if self._check_goal():
                 return
@@ -637,9 +755,12 @@ class Game:
         self.w *= math.exp(-SPIN_DRAG * h)
         self.puck = (self.puck[0] + self.v[0] * h, self.puck[1] + self.v[1] * h)
         self.angle += self.w * h
-        for c, cv, r, power in mallets:
-            if self._hit_circle(c, r, cv, E_MALLET, "hit") and power:
-                self.v = (self.v[0] * POWER_HIT, self.v[1] * POWER_HIT)
+        for c, cv, r, power, side in mallets:
+            jn = self._hit_circle(c, r, cv, E_MALLET, "hit")
+            if jn:
+                if power:
+                    self.v = (self.v[0] * POWER_HIT, self.v[1] * POWER_HIT)
+                self._hit(side, jn)
         self._hit_walls()
         for post in self.posts():
             self._hit_circle(post, 0.0, (0.0, 0.0), E_POST, "post")
@@ -662,7 +783,7 @@ class Game:
             self._contact((-1.0, 0.0), self.puck[0] - hi, (0.0, 0.0), E_WALL, "wall")
 
     def _hit_circle(self, c, r, cv, e, kind):
-        """True if the puck bounced off the circle."""
+        """The impulse if the puck bounced off the circle, else 0 (so: true if it bounced)."""
         dx, dy = self.puck[0] - c[0], self.puck[1] - c[1]
         d = math.hypot(dx, dy)
         reach = PUCK_R + r
@@ -675,24 +796,24 @@ class Game:
         """Resolve a contact: n points from the other body to the puck, vo is its velocity."""
         nx, ny = n
         self.puck = (self.puck[0] + nx * pen, self.puck[1] + ny * pen)
-        # velocity of the puck's rim at the contact point (r = -n R), relative to the other body
-        rx, ry = -nx * PUCK_R, -ny * PUCK_R
-        vrx = self.v[0] - self.w * ry - vo[0]
-        vry = self.v[1] + self.w * rx - vo[1]
-        vn = vrx * nx + vry * ny
-        if vn >= 0:
-            return False  # already separating
-        jn = -(1 + e) * vn  # normal impulse per unit puck mass
-        tx, ty = -ny, nx
-        vt = vrx * tx + vry * ty
-        # tangential impulse: 3 = 1/m + R^2/I for a solid disc; capped by Coulomb friction
-        jt = max(-FRICTION * jn, min(FRICTION * jn, -vt / 3))
-        self.v = (self.v[0] + jn * nx + jt * tx, self.v[1] + jn * ny + jt * ty)
-        self.w -= 2 * jt / PUCK_R  # r x t = -R, I = R^2 / 2
+        self.v, self.w, jn = bounce(self.v, self.w, n, vo, e)
+        if not jn:
+            return 0.0  # already separating
         self.events.append((kind, jn))
         if jn > RING_MIN:
-            self.rings.append((self.puck[0] + rx, self.puck[1] + ry, self.clock, min(jn / 120, 1.0)))
-        return True
+            self.rings.append((self.puck[0] - nx * PUCK_R, self.puck[1] - ny * PUCK_R, self.clock,
+                               min(jn / 120, 1.0)))
+        return jn
+
+    def _hit(self, side, jn):
+        """A mallet hit the puck: count the rally (once per hit, not per contact) and the shot speed."""
+        if jn < HIT_MIN:
+            return
+        who, t = self.last_hit
+        if who != side or self.clock - t > HIT_GAP:
+            self.rally += 1
+        self.last_hit = (side, self.clock)
+        self.shot = (side, min(math.hypot(*self.v), MAX_PUCK_SPEED) * KMH)
 
     def _check_goal(self):
         x, y = self.puck
@@ -705,6 +826,17 @@ class Game:
             return False
         self.scores[scorer] += 1
         self.events.append(("goal", scorer))
+        # shot speed for the goal screen, and the session records (people only)
+        self.goal_kmh = self.shot[1] if self.shot else math.hypot(*self.v) * KMH
+        new = []
+        if self.mode != "attract":
+            if self.shot and self.shot[0] == scorer and scorer not in self.ai and self.goal_kmh > self.best_shot:
+                self.best_shot = self.goal_kmh
+                new.append("Fastest shot")
+            if self.rally > self.best_rally:
+                self.best_rally = self.rally
+                new.append("Longest rally")
+        self.new_record = " + ".join(new) if new else False
         # "GOAL!", then the replay, then the serve (or, for the winning goal, the result)
         self._record()
         self.live = False
@@ -745,6 +877,7 @@ class Game:
             # draw upright on a transparent layer in half-local coords, rotate, composite
             layer = np.zeros((img.shape[0], hw, 4), np.uint8)
             cx, cy = W / 4, H / 2
+            choosing = not self.started and self.choosing and self.choosing[0] == side
             text(layer, f"{self.scores['left']} : {self.scores['right']}", (cx, cy - 19), 5, rgba(DARK))
             if self.pause:
                 who = "Player 1" if self.pause_side == "left" else "Player 2"
@@ -754,11 +887,17 @@ class Game:
                 text(layer, big, (cx, cy - 12), 4, rgba(DARK))
                 if small:
                     text(layer, small, (cx, cy - 6), 2.5, rgba(DARK))
+            elif choosing:
+                text(layer, "Pick a difficulty: stand on it and spin!", (cx, cy - 12), 3, rgba(GREEN))
             elif self.first:
                 text(layer, "Pick a mode: stand on it and spin!", (cx, cy - 12), 3, rgba(GREEN))
             elif self.flash:
                 word = "REPLAY" if self.replaying() else "GOAL!"
                 text(layer, word, (cx, cy - 12), 7, rgba(PLAYER_C[self.flash]))
+                if self.goal_kmh is not None:
+                    text(layer, f"{self.goal_kmh:.1f} km/h", (cx, cy - 5), 2.5, rgba(DARK))
+                if self.new_record:
+                    text(layer, f"NEW RECORD! {self.new_record}", (cx, cy - 1), 2.5, rgba(GREEN))
             elif not self.started:
                 for s in ("left", "right"):
                     if self.scores[s] >= WIN_SCORE:
@@ -767,13 +906,19 @@ class Game:
             elif self.mode == "attract":
                 text(layer, "Grab a mallet to play!", (cx, cy - 12), 4, rgba(GREEN))
             elif side in self.ai:
-                text(layer, "Computer", (cx, cy - 12), 3, rgba(DARK))
+                text(layer, f"Computer ({self.level.capitalize()})", (cx, cy - 12), 3, rgba(DARK))
             for i, k in enumerate(self.active(side)):
                 text(layer, POWER_LABEL[k], (cx, cy + 12 + 4 * i), 3, rgba(POWER_C[k]))
-            if not self.started:  # one square per mode, across the player's view
-                for mode, off in MODE_SQUARES.items():
-                    cv2.rectangle(layer, px(cx + off - 6, cy - 6), px(cx + off + 6, cy + 6), rgba(BLACK), -1)
-                    text(layer, MODE_LABEL[mode], (cx + off, cy), 2, rgba(WHITE), max_w=11)
+            if not self.started:  # one square per mode (or difficulty), across the player's view
+                squares = LEVEL_SQUARES if choosing else MODE_SQUARES
+                for name, off in squares.items():
+                    fill = LINE_RED if name == "hard" else BLACK
+                    cv2.rectangle(layer, px(cx + off - 6, cy - 6), px(cx + off + 6, cy + 6), rgba(fill), -1)
+                    label = name.capitalize() if choosing else MODE_LABEL[name]
+                    text(layer, label, (cx + off, cy), 2, rgba(WHITE), max_w=11)
+                if self.best_shot or self.best_rally:
+                    text(layer, f"Fastest shot {self.best_shot:.1f} km/h   Longest rally {self.best_rally}",
+                         (cx, cy + 11), 2, rgba(DARK))
             if FACING[side]:
                 m = cv2.getRotationMatrix2D((hw / 2, img.shape[0] / 2), FACING[side], 1)
                 layer = cv2.warpAffine(layer, m, (hw, img.shape[0]))
@@ -789,7 +934,8 @@ class Game:
         key = (self.pause, self.pause_side,
                self.scores["left"], self.scores["right"], self.started, self.first, self.flash, replaying,
                self.mode, tuple(sorted(self.ai)), self.goal_half("left"), self.goal_half("right"),
-               self.active("left"), self.active("right"))
+               self.active("left"), self.active("right"), self.choosing and self.choosing[0], self.level,
+               self.goal_kmh, self.new_record, self.best_shot, self.best_rally)
         if key != self._bg_key:
             self._bg_key, self._bg = key, self._draw_background()
         img = self._bg.copy()
@@ -819,6 +965,9 @@ class Game:
                            max(1, int(0.4 * PX)), cv2.LINE_AA)
         if puck:
             draw_puck(img, puck, angle)
+        if self.started and self.live and not self.pause and self.rally >= RALLY_SHOW:
+            for side in ("left", "right"):
+                stamp(img, f"Rally {self.rally}", side, (0, -6), 3, rgba(DARK))
         return img
 
     def frame(self):
@@ -873,6 +1022,35 @@ def draw_puck(img, pos, angle):
     cv2.line(img, px(pos[0] + ca * PUCK_R * 0.3, pos[1] + sa * PUCK_R * 0.3),
              px(pos[0] + ca * PUCK_R * 0.85, pos[1] + sa * PUCK_R * 0.85),
              rgba((225, 225, 232)), max(1, int(r * 0.16)), cv2.LINE_AA)
+
+
+def stamp(img, s, side, offset, height, color):
+    """Text that changes every frame, drawn straight onto the frame, upright for `side`'s player.
+    offset is (across their view, towards them) from the centre of their half, as in the background
+    layer. Redrawing the whole background for it would take ~100x longer."""
+    font, thick = cv2.FONT_HERSHEY_SIMPLEX, max(1, int(height * PX / 12))
+    (tw, th), _ = cv2.getTextSize(s, font, 1.0, thick)
+    scale = height * PX / th
+    (tw, th), base = cv2.getTextSize(s, font, scale, thick)
+    n = max(tw, th + base) + 4
+    patch = np.zeros((n, n, 4), np.uint8)
+    cv2.putText(patch, s, (n // 2 - tw // 2, n // 2 + th // 2), font, scale, color, thick, cv2.LINE_AA)
+    if FACING[side]:
+        m = cv2.getRotationMatrix2D((n / 2, n / 2), FACING[side], 1)
+        patch = cv2.warpAffine(patch, m, (n, n))
+    a = math.radians(FACING[side])
+    dx, dy = offset
+    x = (W / 4 if side == "left" else 3 * W / 4) + math.cos(a) * dx + math.sin(a) * dy
+    y = H / 2 - math.sin(a) * dx + math.cos(a) * dy
+    x0, y0 = int(x * PX) - n // 2, int(y * PX) - n // 2
+    sx, sy = max(0, -x0), max(0, -y0)  # clip to the image
+    ex, ey = min(n, img.shape[1] - x0), min(n, img.shape[0] - y0)
+    if ex <= sx or ey <= sy:
+        return
+    patch = patch[sy:ey, sx:ex]
+    region = img[y0 + sy:y0 + ey, x0 + sx:x0 + ex]
+    inv = 255 - patch[..., 3:].astype(np.uint16)  # premultiplied, as in _draw_background
+    region[:] = patch + (region * inv // 255).astype(np.uint8)
 
 
 def text(img, s, centre, height, color, max_w=W / 2 * 0.9):
@@ -1042,12 +1220,35 @@ if __name__ == "__main__":
         spot = square_spot("left", off)
         msg(left, *spot); msg(left, *spot, 1.0)  # stand on it and spin
         g.step(0.016)
+        if mode == "computer":  # first the squares turn into Easy / Medium / Hard
+            assert not g.started and g.choosing[0] == "left"
+            img = g.render()
+            hx, hy = square_spot("left", LEVEL_SQUARES["hard"])
+            assert tuple(img[int((hy + 5) * PX), int((hx + 5) * PX)][:3]) == LINE_RED  # Hard is red
+            msg(left, *spot, 2.0)  # still spinning from picking "vs Computer": doesn't pick yet
+            g.step(0.016)
+            assert not g.started
+            g.step(CHOOSE_GRACE)
+            spot = square_spot("left", LEVEL_SQUARES["hard"])
+            msg(left, *spot, 2.0); msg(left, *spot, 3.0)
+            g.step(0.016)
+            assert g.level == "hard"
         assert g.started and g.mode == mode, (mode, g.mode)
         assert g.ai == ({"right"} if mode == "computer" else set())
+    # nobody picks a difficulty: the mode squares come back
+    g.stop_game()
+    left.heading, left.spin = None, 0.0
+    spot = square_spot("left", MODE_SQUARES["computer"])
+    msg(left, *spot); msg(left, *spot, 1.0)
+    g.step(0.016)
+    assert g.choosing
+    still(left, (8, 8))
+    g.step(CHOOSE_TIMEOUT + 0.1); g.step(0.016)
+    assert g.choosing is None and not g.started
     g.stop_game()
 
-    # computer player (AI_ERROR off, so it plays its best): blocks a shot at its goal ...
-    AI_ERROR, ai_error = 0.0, AI_ERROR
+    # computer player (medium, aiming error off): blocks a shot at its goal ...
+    ai_error, AI_LEVELS["medium"]["error"] = AI_LEVELS["medium"]["error"], 0.0
     c = Game(bind=False)
     cl, cr = c.players
     c.seen = math.inf
@@ -1063,7 +1264,7 @@ if __name__ == "__main__":
         c.puck = spot
         run(c, 3.0, lambda: c.puck[0] < W / 2)
         assert c.puck[0] < W / 2 and c.scores["left"] == 0, (spot, c.puck, c.scores)
-    AI_ERROR = ai_error
+    AI_LEVELS["medium"]["error"] = ai_error
 
     # attract: nobody moves for ATTRACT_AFTER -> the computer plays both sides
     a = Game(bind=False)
@@ -1192,6 +1393,75 @@ if __name__ == "__main__":
     play(1.0, left_tracked=False)
     assert q.pause == "lost" and q.pause_side == "left"
 
+    # shots, rallies and records
+    sg = Game(bind=False)
+    sl, sr = sg.players
+    sg.seen = math.inf
+    sg.start("classic")
+    sg.reset_puck()
+    still(sl, (40, 30)); still(sr, (100, 30))
+    sg.puck, sg.v = (50, 30), (-60, 0)  # into the left mallet ...
+    run(sg, 0.5, lambda: sg.rally == 1)
+    assert sg.rally == 1 and sg.shot[0] == "left" and sg.shot[1] > 0
+    run(sg, 2.0, lambda: sg.rally == 2)  # ... back across into the right one
+    assert sg.rally == 2 and sg.shot[0] == "right"
+    # pushing the puck along for a while is one hit, not one per frame
+    sg.reset_puck()
+    sg.puck = (45, 30)
+    for i in range(30):
+        sl.prev, sl.pos, sl.vel = (40 + i * 0.5, 30), (40.5 + i * 0.5, 30), (30, 0)
+        sg.step(1 / 60)
+    assert sg.rally == 1, sg.rally
+    # a goal shows the shot's speed; a person's shot sets the record, the computer's doesn't
+    sg.reset_puck()
+    still(sr, (100, 60))
+    sg.puck = (60, H / 2)
+    sl.prev, sl.pos, sl.vel = (50, H / 2), (56, H / 2), (120, 0)  # moving into it this frame
+    run(sg, 2.0, lambda: not sg.live)
+    assert sg.scores["left"] == 1 and sg.goal_kmh > 10 and sg.best_shot == sg.goal_kmh
+    assert sg.new_record and "Fastest shot" in sg.new_record
+    assert abs(sg.goal_kmh - sg.shot[1]) < 1e-9 and sg.goal_kmh <= MAX_PUCK_SPEED * KMH
+    sg.render()
+    best = sg.best_shot
+    sg.start("computer", "right", "hard")  # computer on the left
+    sg.reset_puck()
+    still(sr, (100, 60))
+    sg.puck, sg.v = (W / 2 - 3, H / 2), (0, 0)
+    run(sg, 20.0, lambda: not sg.live)
+    assert sg.scores["left"] == 1 and sg.best_shot == best  # the computer scored: no record
+    # rally counter drawn live (no background redraw) from RALLY_SHOW hits
+    sg.start("classic")
+    sg.rally = RALLY_SHOW - 1
+    quiet = sg.render()
+    sg.rally = RALLY_SHOW
+    assert (sg.render() != quiet).any() and sg._bg is not None
+    # records on the start screen
+    sg.stop_game()
+    sg.render()
+
+    # hard computer: predicts where the puck crosses, bounces included ...
+    hg = Game(bind=False)
+    hg.seen = math.inf
+    hg.start("classic")
+    for p in hg.players:
+        still(p, (8, 8) if p.side == "left" else (W - 8, 8))
+    hg.puck, hg.v = (40, 15), (90, 70)  # will bounce off the bottom wall on the way
+    guess = hg._crossing(120.0)
+    while hg.puck[0] < 120:
+        hg.step(1 / 120)
+    assert abs(hg.puck[1] - guess) < 1.0, (hg.puck, guess)
+    # ... and saves fast straight shots and bank shots
+    for i, (y0, ty) in enumerate(((10, 30), (55, 40), (20, -28), (50, 96))):  # last two: off a wall
+        hg = Game(bind=False)
+        hg.seen = math.inf
+        hg.start("computer", "left", "hard")
+        still(hg.players[0], (10, 60))
+        hg.reset_puck()
+        n = math.hypot(W - 60, ty - y0)
+        hg.puck, hg.v = (60, y0), ((W - 60) / n * 160, (ty - y0) / n * 160)
+        run(hg, 3.0, lambda: not hg.live)
+        assert hg.scores["left"] == 0, i
+
     # power-ups
     pg = Game(bind=False)
     pl, pr = pg.players
@@ -1206,6 +1476,7 @@ if __name__ == "__main__":
     assert pg.item is None and pl.r == MALLET_R * BIG and pr.r == MALLET_R
     pg.render()
     pg.clock += POWER_TIME
+    pg.next_item = math.inf  # collecting one scheduled the next
     pg.step(1 / 60)
     assert pl.r == MALLET_R and pg.active("left") == ()
     # small_goal: the opponent's goal shrinks, so a shot that used to score bounces
@@ -1217,6 +1488,7 @@ if __name__ == "__main__":
     pg.step(0.3)
     assert pg.scores["right"] == 0 and pg.v[0] > 0, (pg.scores, pg.v)
     pg.clock += POWER_TIME
+    pg.next_item = math.inf  # collecting one scheduled the next
     # power_hit: the same hit sends the puck POWER_HIT times faster
     def launch():
         pg.reset_puck()
@@ -1228,6 +1500,7 @@ if __name__ == "__main__":
     pg.effects["left"]["power_hit"] = pg.clock + POWER_TIME
     assert abs(launch() - min(plain * POWER_HIT, MAX_PUCK_SPEED)) < 2, (plain, pg.v)
     pg.clock += POWER_TIME
+    pg.next_item = math.inf  # collecting one scheduled the next
     # freeze: the opponent's mallet stops following its tracker for FREEZE_TIME
     pg.reset_puck()
     still(pl, (30, 30)); still(pr, (100, 30))
@@ -1238,6 +1511,7 @@ if __name__ == "__main__":
     pg.step(1 / 60)
     assert pr.pos == (100, 30)
     pg.clock += FREEZE_TIME
+    pg.next_item = math.inf
     msg(pr, 110, 40)
     pg.step(1 / 60)
     assert near(pr.pos, (110, 40))
