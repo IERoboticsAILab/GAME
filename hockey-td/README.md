@@ -112,9 +112,12 @@ Classic is in the middle, where the single Start square used to be, and plays ex
   - **Easy:** slow and sloppy.
   - **Medium:** the original computer.
   - **Hard:** predicts where the puck will cross in front of its goal (wall bounces included), moves
-    about 3x faster, and picks between a straight shot and bank shots off either side wall, whichever
-    path is furthest from your mallet. In simulated games it saved every test shot (straight and
-    banked, up to full speed) and beat Medium about 7-1 in 6 minutes. Expect it to be very hard to score on.
+    about twice as fast as Medium (a quick player, ~4 m/s), goes and hits slow pucks instead of waiting
+    for them, and picks between a straight shot and bank shots off either side wall, whichever path is
+    furthest from your mallet. In simulated games it saved every test shot (straight and banked, up to
+    full speed) and beat Medium 47-0 over 48 minutes. Expect it to be very hard to score on.
+
+  Every level moves like a person: its mallet speeds up and brakes within `accel` instead of jumping.
 - **Attract:** when no tracker has moved for `ATTRACT_AFTER` seconds on the start screen, the computer
   plays both sides with "Grab a mallet to play!". The moment a tracker moves, it goes back to the start
   screen. A game nobody is playing any more (no tracker moving for `ABANDON_AFTER` seconds) ends the
@@ -140,7 +143,8 @@ shows "GOAL!" for `GOAL_FLASH` seconds, then replays them at `REPLAY_SPEED` (0.5
 "REPLAY", then serves. The winning goal gets its replay before the result.
 
 **Computer player knobs:** `AI_LEVELS` has one line per difficulty: `speed` (top speed; people manage
-about 250), `reaction` (how far its aim lags), `error` (how far off its guarding can be, picked again each
+about 250 in a burst), `accel` (how quickly it can speed up, brake or turn: lower looks calmer, higher
+looks twitchier; a quick arm is about 400-800), `reaction` (how far its aim lags), `error` (how far off its guarding can be, picked again each
 time the puck comes over; the main knob for Easy and Medium), `incoming` (shots faster than this get
 goalkeeping instead of a strike), `predict`, `banks` and `precision` (how exactly it lines up before
 striking; smaller is more accurate but shoots less). To make Hard beatable, raise its `error` or lower
@@ -152,8 +156,8 @@ scale: 1 table unit is about 2.5 cm, so the fastest puck is about 14 km/h) shows
 shot and longest rally (people only: the computer's shots and attract mode don't count); beating one
 shows "NEW RECORD!". They reset when TouchDesigner restarts or the module is reloaded.
 
-**Stuck puck:** a puck that sits still for `STALL_TIME` seconds drifts back towards the centre at
-`STALL_PUSH`, like the air on a real table. A puck pressed into a deep corner can't be pushed out by any
+**Stuck puck:** a puck that sits still for `STALL_TIME` seconds (`STALL_TIME_AI` in the computer's half)
+drifts back towards the centre at `STALL_PUSH`, like the air on a real table. A puck pressed into a deep corner can't be pushed out by any
 mallet (mallets stay further inside the rails than the puck), so without this a game could stall.
 
 ## Tuning (top of `hockey_game.py`)

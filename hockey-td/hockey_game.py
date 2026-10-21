@@ -62,18 +62,23 @@ ABANDON_AFTER = 60.0  # s with no tracker moving mid-game -> back to the start s
 ACTIVE_MOVE = 1.0  # a tracker counts as moving once it is this far from where it last was
 
 # COMPUTER PLAYER, per difficulty (picked after spinning on "vs Computer"):
-#   speed     top mallet speed (people manage ~250)
+#   speed     top mallet speed (people manage ~250 in a burst)
+#   accel     how fast it can speed up, slow down or turn (a quick arm: ~400-800; 1000 = 25 m/s^2).
+#             It speeds up and brakes like an arm instead of jumping, so it looks like a person
 #   reaction  s, how far its aim lags behind where it wants to be
 #   error     how far off its guarding can be; picked again each time the puck comes over
-#   incoming  a puck coming at its goal faster than this gets goalkeeping, not a strike
+#   incoming  a puck coming at its goal faster than this gets goalkeeping; slower ones it goes and hits
 #   predict   guard where the puck WILL cross (bounces included), not where it is now
 #   banks     also consider bank shots off the side walls, away from the opponent's mallet
 #   precision how close to the spot behind the puck it must be before it strikes (smaller = more
 #             accurate shots, but fewer of them; 1.4 scored most in simulated games)
 AI_LEVELS = {
-    "easy": dict(speed=45.0, reaction=0.25, error=10.0, incoming=20.0, predict=False, banks=False, precision=3.0),
-    "medium": dict(speed=70.0, reaction=0.15, error=7.0, incoming=20.0, predict=False, banks=False, precision=3.0),
-    "hard": dict(speed=220.0, reaction=0.02, error=0.5, incoming=20.0, predict=True, banks=True, precision=1.4),
+    "easy": dict(speed=45.0, accel=300.0, reaction=0.25, error=10.0, incoming=20.0, predict=False,
+                 banks=False, precision=3.0),
+    "medium": dict(speed=70.0, accel=500.0, reaction=0.15, error=7.0, incoming=20.0, predict=False,
+                   banks=False, precision=3.0),
+    "hard": dict(speed=160.0, accel=1200.0, reaction=0.02, error=0.5, incoming=70.0, predict=True,
+                 banks=True, precision=1.4),
 }
 CAREFUL_SPEED = 70.0  # top speed going round the puck or near its own end rail, so it doesn't clip it in
 LEVEL_SQUARES = {"easy": -20.0, "medium": 0.0, "hard": 20.0}  # replace the mode squares while choosing
@@ -121,6 +126,7 @@ FRICTION = 0.2  # rim friction; turns glancing hits into spin
 MAX_PUCK_SPEED = 160.0
 MAX_MALLET_SPEED = 250.0  # faster tracker jumps are glitches, clamped
 STALL_TIME = 3.0  # s a puck may sit still before the "air" drifts it back towards the centre
+STALL_TIME_AI = 1.0  # the same in the computer's half: it doesn't need time to line up a shot
 STALL_SPEED = 3.0  # slower than this counts as still
 STALL_PUSH = 12.0  # speed of that drift; a puck in a deep corner can't be reached by any mallet
 MALLET_SMOOTH = 0.5  # 0..1, how quickly mallet velocity follows the tracker (lower = smoother)
@@ -341,6 +347,7 @@ class Game:
         self.ai_aim = {}  # side -> where the computer is heading (lags the puck by AI_REACTION)
         self.ai_err = {}  # side -> (puck in its half?, guarding error for that visit)
         self.ai_shot = {}  # side -> shot the computer is lining up (index into its candidates)
+        self.ai_vel = {}  # side -> the computer mallet's velocity (it accelerates, it doesn't jump)
         self.level = "medium"  # computer difficulty
         self.choosing = None  # (side, wall time it started) while that player picks a difficulty
         self.rally, self.last_hit = 0, (None, -1.0)  # hits since the serve; (side, clock) of the last
@@ -361,7 +368,7 @@ class Game:
         """Start a game in `mode`. For "computer", the computer plays the half opposite `side`
         at `level` ("easy", "medium" or "hard")."""
         self.mode, self.level, self.choosing = mode, level, None
-        self.ai_shot = {}
+        self.ai_shot, self.ai_vel = {}, {}
         self.ai = {"computer": {other(side)}, "attract": {"left", "right"}}.get(mode, set())
         self.ai_aim, self.ai_err = {}, {}
         self.mode_since = self.clock
@@ -554,12 +561,16 @@ class Game:
                     self.start(on, p.side)
                 break
 
+    @staticmethod
+    def _half(pos):
+        return "left" if pos[0] < W / 2 else "right"
+
     def _unstall(self):
         """A puck left still for STALL_TIME drifts back towards the centre, so a game can't
         get stuck with the puck in a corner where no mallet can push it out."""
         if math.hypot(*self.v) >= STALL_SPEED:
             self.still_since = self.clock
-        elif self.clock - self.still_since > STALL_TIME:
+        elif self.clock - self.still_since > (STALL_TIME_AI if self._half(self.puck) in self.ai else STALL_TIME):
             dx, dy = W / 2 - self.puck[0], H / 2 - self.puck[1]
             n = math.hypot(dx, dy) or 1.0
             self.v = (dx / n * STALL_PUSH, dy / n * STALL_PUSH)
@@ -570,14 +581,14 @@ class Game:
     def _ai_move(self, p, dt):
         """Guard the goal while the puck is away; get behind it and strike when it's in our half."""
         lv = AI_LEVELS[self.level]
-        speed = lv["speed"]
+        speed, rush = lv["speed"], False  # rush: go through the target at full speed (a strike)
         me, toward = p.prev, (1.0 if p.side == "left" else -1.0)
         bx, by = self.puck
         ours = self.live and (bx - W / 2) * toward < 0  # puck in our half
         if ours != self.ai_err.get(p.side, (None,))[0]:  # it came over (or left): new error
             self.ai_err[p.side] = (ours, random.uniform(-lv["error"], lv["error"]))
         if ours and self.v[0] * toward > -lv["incoming"]:  # in our half and not a shot at us: play it
-            ax, ay = self._shot_aim(p, lv["banks"])  # from the puck towards where we'll send it
+            ax, ay = self._shot_aim(p, lv["banks"], (bx, by))  # from the puck towards where we'll send it
             back = PUCK_R + p.r + 1.0
             raw = (bx - ax * back, by - ay * back)
             behind = clamp(raw, p.side, p.r)  # by the rails, as close behind as we can get
@@ -591,7 +602,7 @@ class Game:
                 # centre side and wait for it to drift out (see _unstall)
                 speed = min(speed, CAREFUL_SPEED)  # close to our own goal: no wild moves
                 if their_way and n < back + 3:
-                    target = (bx + ux * 4, by + uy * 4)
+                    target, rush = (bx + ux * 4, by + uy * 4), True
                 else:  # wait beside the line it will drift along, so it drifts past us
                     dx, dy = W / 2 - bx, H / 2 - by
                     c = math.hypot(dx, dy) or 1.0
@@ -604,7 +615,7 @@ class Game:
                 target = (behind[0] - ay * side * back * 1.5, behind[1] + ax * side * back * 1.5)
                 speed = min(speed, CAREFUL_SPEED)  # don't clip it on the way round
             elif math.dist(me, behind) < lv["precision"] and their_way:
-                target = (bx + ux * 4, by + uy * 4)  # in position: strike through it
+                target, rush = (bx + ux * 4, by + uy * 4), True  # in position: strike through it
             else:
                 target = behind
         else:
@@ -620,35 +631,54 @@ class Game:
         k = min(1.0, dt / lv["reaction"]) if lv["reaction"] > 0 else 1.0
         aim = (aim[0] + (target[0] - aim[0]) * k, aim[1] + (target[1] - aim[1]) * k)
         self.ai_aim[p.side] = aim
-        d = math.dist(me, aim)
-        f = min(1.0, speed * dt / d) if d > 1e-9 else 0.0
-        p.pos = clamp((me[0] + (aim[0] - me[0]) * f, me[1] + (aim[1] - me[1]) * f), p.side, p.r)
-        p.vel = ((p.pos[0] - me[0]) / dt, (p.pos[1] - me[1]) / dt) if dt > 0 else (0.0, 0.0)
+        if dt <= 0:
+            return
+        # move like an arm: accelerate towards the spot at no more than `accel`, and brake in time
+        # to stop on it (unless striking, which goes through at full speed)
+        vx, vy = self.ai_vel.get(p.side, (0.0, 0.0))
+        dx, dy = aim[0] - me[0], aim[1] - me[1]
+        d = math.hypot(dx, dy)
+        want = speed if rush else min(speed, math.sqrt(2 * lv["accel"] * d))
+        wx, wy = (dx / d * want, dy / d * want) if d > 1e-6 else (0.0, 0.0)
+        cx, cy = wx - vx, wy - vy
+        c, most = math.hypot(cx, cy), lv["accel"] * dt
+        if c > most:
+            cx, cy = cx / c * most, cy / c * most
+        vx, vy = vx + cx, vy + cy
+        p.pos = clamp((me[0] + vx * dt, me[1] + vy * dt), p.side, p.r)
+        p.vel = ((p.pos[0] - me[0]) / dt, (p.pos[1] - me[1]) / dt)  # a rail or the centre line stops it
+        self.ai_vel[p.side] = p.vel
 
-    def _crossing(self, x_line, horizon=2.0, h=1 / 120):
-        """y where the puck will cross x = x_line, following its drag and the side-wall bounces
-        (mallets and posts ignored). The current y if it won't get there within `horizon` s."""
+    def _path(self, horizon, h=1 / 120):
+        """Where the puck will be, every h s for `horizon` s: its drag and the side-wall bounces,
+        the same steps as _substep (mallets, posts and end rails ignored)."""
         (x, y), v, w = self.puck, self.v, self.w
         lo, hi = RAIL + PUCK_R, H - RAIL - PUCK_R
         k, kw = math.exp(-AIR_DRAG * h), math.exp(-SPIN_DRAG * h)
-        for _ in range(int(horizon / h)):  # the same steps as _substep, walls only
+        for _ in range(int(horizon / h)):
             v, w = (v[0] * k, v[1] * k), w * kw
-            nx, ny = x + v[0] * h, y + v[1] * h
-            if (x - x_line) * (nx - x_line) <= 0:
-                return y + (ny - y) * ((x_line - x) / (nx - x) if nx != x else 0.0)
-            x, y = nx, ny
+            x, y = x + v[0] * h, y + v[1] * h
             if y < lo:
                 y = lo
                 v, w, _ = bounce(v, w, (0.0, 1.0), (0.0, 0.0), E_WALL)
             elif y > hi:
                 y = hi
                 v, w, _ = bounce(v, w, (0.0, -1.0), (0.0, 0.0), E_WALL)
+            yield x, y
+
+    def _crossing(self, x_line, horizon=2.0):
+        """y where the puck will cross x = x_line; the current y if not within `horizon` s."""
+        (x, y) = self.puck
+        for nx, ny in self._path(horizon):
+            if (x - x_line) * (nx - x_line) <= 0:
+                return y + (ny - y) * ((x_line - x) / (nx - x) if nx != x else 0.0)
+            x, y = nx, ny
         return self.puck[1]
 
-    def _shot_aim(self, p, banks):
-        """Unit vector from the puck along the shot we're lining up: straight at their goal, or
-        (with banks) off the top or bottom wall, whichever path keeps furthest from their mallet."""
-        bx, by = self.puck
+    def _shot_aim(self, p, banks, puck):
+        """Unit vector from the puck (at `puck`) along the shot we're lining up: straight at their
+        goal, or (with banks) off the top or bottom wall, whichever path keeps furthest from their mallet."""
+        bx, by = puck
         gx = W if p.side == "left" else 0.0
         goal = (gx, H / 2)
         paths = [[(bx, by), goal]]
@@ -1426,8 +1456,9 @@ if __name__ == "__main__":
     sg.start("computer", "right", "hard")  # computer on the left
     sg.reset_puck()
     still(sr, (100, 60))
-    sg.puck, sg.v = (W / 2 - 3, H / 2), (0, 0)
-    run(sg, 20.0, lambda: not sg.live)
+    sg.puck, sg.v = (W - 5, H / 2), (150, 0)  # the computer's shot, about to go in
+    sg.shot = ("left", 150 * KMH)
+    run(sg, 1.0, lambda: not sg.live)
     assert sg.scores["left"] == 1 and sg.best_shot == best  # the computer scored: no record
     # rally counter drawn live (no background redraw) from RALLY_SHOW hits
     sg.start("classic")
@@ -1461,6 +1492,52 @@ if __name__ == "__main__":
         hg.puck, hg.v = (60, y0), ((W - 60) / n * 160, (ty - y0) / n * 160)
         run(hg, 3.0, lambda: not hg.live)
         assert hg.scores["left"] == 0, i
+
+    # the computer moves like a person: no jumps (acceleration within its limit, except stopping
+    # dead at a rail or the centre line, as a person's mallet does) ...
+    for level in AI_LEVELS:
+        mg = Game(bind=False)
+        mg.seen = math.inf
+        mg.start("attract")
+        mg.level = level
+        vels = []
+        for _ in range(30 * 60):
+            mg.step(1 / 60)
+            vels.append(mg.players[1].vel)
+        jolts = [math.dist(a, b) * 60 for a, b in zip(vels, vels[1:])]
+        over = sum(j > AI_LEVELS[level]["accel"] * 1.01 for j in jolts)
+        assert over < len(jolts) * 0.01, (level, over)
+    # ... and doesn't stand and wait for a slow puck rolling at its goal: it goes and hits it
+    sw = Game(bind=False)
+    sw.seen = math.inf
+    sw.start("computer", "left", "hard")
+    still(sw.players[0], (10, 60))
+    sw.reset_puck()
+    sw.puck, sw.v = (85, 30), (30, 0)
+    assert run(sw, 1.0, lambda: sw.rally > 0), sw.puck
+
+    # the computer moves like a person: no jumps (acceleration within its limit, except stopping
+    # dead at a rail or the centre line, as a person's mallet does) ...
+    for level in AI_LEVELS:
+        mg = Game(bind=False)
+        mg.seen = math.inf
+        mg.start("attract")
+        mg.level = level
+        vels = []
+        for _ in range(30 * 60):
+            mg.step(1 / 60)
+            vels.append(mg.players[1].vel)
+        jolts = [math.dist(a, b) * 60 for a, b in zip(vels, vels[1:])]
+        over = sum(j > AI_LEVELS[level]["accel"] * 1.01 for j in jolts)
+        assert over < len(jolts) * 0.01, (level, over)
+    # ... and doesn't stand and wait for a slow puck rolling at its goal: it goes and hits it
+    sw = Game(bind=False)
+    sw.seen = math.inf
+    sw.start("computer", "left", "hard")
+    still(sw.players[0], (10, 60))
+    sw.reset_puck()
+    sw.puck, sw.v = (85, 30), (30, 0)
+    assert run(sw, 1.0, lambda: sw.rally > 0), sw.puck
 
     # power-ups
     pg = Game(bind=False)
